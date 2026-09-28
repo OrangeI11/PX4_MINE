@@ -1,0 +1,233 @@
+/****************************************************************************
+ *
+ *   Copyright (c) 2014-2021 PX4 Development Team. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ ****************************************************************************/
+
+/**
+ * @author Pavel Kirienko <pavel.kirienko@gmail.com>
+ */
+
+#pragma once
+
+#include <containers/List.hpp>
+#include <uavcan/uavcan.hpp>
+#include <drivers/drv_hrt.h>
+#include <drivers/drv_orb_dev.h>
+#include <lib/drivers/device/Device.hpp>
+#include <uORB/uORB.h>
+#include <drivers/uavcan/node_info.hpp>
+
+/**
+ * A sensor bridge class must implement this interface.
+ */
+class IUavcanSensorBridge : uavcan::Noncopyable, public ListNode<IUavcanSensorBridge *>
+{
+public:
+	static constexpr unsigned MAX_NAME_LEN = 20;
+
+	virtual ~IUavcanSensorBridge() = default;
+
+	/**
+	 * Returns ASCII name of the bridge.
+	 */
+	virtual const char *get_name() const = 0;
+
+	/**
+	 * Starts the bridge.
+	 * @return Non-negative value on success, negative on error.
+	 */
+	virtual int init() = 0;
+
+	/**
+	 * Returns number of active redundancy channels.
+	 */
+	virtual unsigned get_num_redundant_channels() const = 0;
+
+	/**
+	 * Prints current status in a human readable format to stdout.
+	 */
+	virtual void print_status() const = 0;
+
+	virtual void update() {};
+
+	/**
+	 * Sensor bridge factory.
+	 * Creates all known sensor bridges and puts them in the linked list.
+	 */
+	static void make_all(uavcan::INode &node, List<IUavcanSensorBridge *> &list,
+			     NodeInfoPublisher *node_info_publisher);
+};
+
+namespace uavcan_bridge
+{
+struct Channel {
+	int node_id{-1};
+	orb_advert_t orb_advert{nullptr};
+	int instance{-1};
+	void *h_driver{nullptr};
+	uint8_t iface_index{0};
+};
+
+// Node timestamps are in the bus shared time base, whose offset from HRT is
+// arbitrary: the FC seeds its bus clock from HRT at whatever phase the driver's
+// free-running timer happens to be, and a lower node ID master can discipline
+// it. Subtracting the bus-time age from an HRT reading taken at the same
+// instant cancels the offset; the ISR receive stamp would leave the transfer
+// and scheduling latency in the result. UNKNOWN, unconverged and foreign-epoch
+// stamps fall back to the receive time.
+inline hrt_abstime sample_timestamp(uint64_t node_timestamp_us, uint64_t bus_now_us, hrt_abstime now)
+{
+	static constexpr uint64_t kMaxTransportDelay = 100_ms;
+
+	if (node_timestamp_us > 0 && bus_now_us >= node_timestamp_us
+	    && (bus_now_us - node_timestamp_us) < kMaxTransportDelay) {
+		return now - (bus_now_us - node_timestamp_us);
+	}
+
+	return now;
+}
+
+/**
+ * Rate and sample time to publish from a RawIMU field pair.
+ *
+ * When an integral is present its mean over the interval is preferred over the
+ * point sample: it is float32 rather than float16, it is anti-aliased against the
+ * node's full-rate stream, and successive means spaced one interval apart
+ * integrate back to the node's exact deltas in VehicleIMU. A mean belongs at the
+ * centroid of its window, half an interval before the acquisition timestamp that
+ * closes it. Without an integral the point sample is used at the timestamp.
+ */
+static constexpr float kMaxImuIntegrationInterval = 0.1f;
+
+struct ImuRateSample {
+	hrt_abstime timestamp_sample;
+	float x;
+	float y;
+	float z;
+};
+
+template<typename LatestT, typename IntegralT>
+inline ImuRateSample imu_rate_sample(hrt_abstime timestamp_sample, float integration_interval,
+				     const LatestT &latest, const IntegralT &integral)
+{
+	if (integration_interval > 0.f && integration_interval < kMaxImuIntegrationInterval) {
+		const float inv_dt = 1.f / integration_interval;
+		const hrt_abstime half_interval = static_cast<hrt_abstime>(integration_interval * 0.5e6f);
+		return {timestamp_sample - half_interval, integral[0] *inv_dt, integral[1] *inv_dt, integral[2] *inv_dt};
+	}
+
+	return {timestamp_sample, latest[0], latest[1], latest[2]};
+}
+} // namespace uavcan_bridge
+
+/**
+ * This is the base class for redundant sensors with an independent ORB topic per each redundancy channel.
+ * For example, sensor_mag0, sensor_mag1, etc.
+ */
+class UavcanSensorBridgeBase : public IUavcanSensorBridge, public device::Device
+{
+	const orb_id_t _orb_topic;
+	uavcan_bridge::Channel *const _channels;
+	bool _out_of_channels = false;
+
+protected:
+	static constexpr unsigned DEFAULT_MAX_CHANNELS = 4;
+	const unsigned _max_channels;
+	NodeInfoPublisher *_node_info_publisher;
+
+	UavcanSensorBridgeBase(const char *name, const orb_id_t orb_topic_sensor,
+			       NodeInfoPublisher *node_info_publisher,
+			       const unsigned max_channels = DEFAULT_MAX_CHANNELS) :
+		Device(name),
+		_orb_topic(orb_topic_sensor),
+		_channels(new uavcan_bridge::Channel[max_channels]),
+		_max_channels(max_channels),
+		_node_info_publisher(node_info_publisher)
+	{
+		set_device_bus_type(DeviceBusType_UAVCAN);
+		set_device_bus(0);
+	}
+
+	/**
+	 * Sends one measurement into appropriate ORB topic.
+	 * New redundancy channels will be registered automatically.
+	 * @param node_id Sensor's Node ID
+	 * @param report  Pointer to ORB message object
+	 */
+	void publish(const int node_id, const void *report);
+
+	/**
+	 * Init the sensor driver for this channel.
+	 * Implementation depends on sensor type being constructed.
+	 * @param channel Channel pointer for which h_driver should be initialized.
+	 */
+	virtual int init_driver(uavcan_bridge::Channel *channel) { return PX4_OK; };
+
+	uavcan_bridge::Channel *get_channel_for_node(int node_id, uint8_t iface_index);
+
+	/**
+	 * Builds a unique device ID from a UAVCAN message
+	 * @param msg UAVCAN message (must have getSrcNodeID() and getIfaceIndex() methods)
+	 * @return Complete device ID with node address and interface encoded
+	 */
+	template<typename T>
+	uint32_t make_uavcan_device_id(const uavcan::ReceivedDataStructure<T> &msg) const
+	{
+		return make_uavcan_device_id(msg.getSrcNodeID().get(), msg.getIfaceIndex());
+	}
+
+	/**
+	 * Builds a unique device ID from node ID and interface index
+	 * @param node_id UAVCAN node ID
+	 * @param iface_index CAN interface index (0 = CAN1, 1 = CAN2, etc.)
+	 * @return Complete device ID with node address and interface encoded
+	 */
+	uint32_t make_uavcan_device_id(uint8_t node_id, uint8_t iface_index) const
+	{
+		device::Device::DeviceId device_id{};
+		device_id.devid_s.devtype = get_device_type();
+		device_id.devid_s.address = node_id;
+		device_id.devid_s.bus_type = device::Device::DeviceBusType_UAVCAN;
+		device_id.devid_s.bus = iface_index;
+		return device_id.devid;
+	}
+
+public:
+	virtual ~UavcanSensorBridgeBase();
+
+	unsigned get_num_redundant_channels() const override;
+
+	int8_t get_channel_index_for_node(int node_id);
+
+	int get_orb_instance_for_node(int node_id);
+
+	void print_status() const override;
+};
